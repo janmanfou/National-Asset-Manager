@@ -37,7 +37,7 @@ function timeAgo(dateStr: string) {
 
 export default function Dashboard() {
   const { data: dashboard, isLoading: dashLoading } = useQuery<{
-    fileStats: { total: number; processing: number; completed: number; failed: number };
+    fileStats: { total: number; pending: number; completed: number; failed: number };
     voterStats: { total: number; verified: number; flagged: number; incomplete: number };
   }>({
     queryKey: ["/api/analytics/dashboard"],
@@ -51,7 +51,7 @@ export default function Dashboard() {
     ? [
         { title: "Total Files Processed", value: dashboard.fileStats.total.toLocaleString(), change: `${dashboard.fileStats.completed} completed`, icon: FileText, color: "text-blue-500" },
         { title: "Voters Extracted", value: dashboard.voterStats.total.toLocaleString(), change: `${dashboard.voterStats.verified} verified`, icon: Users, color: "text-green-500" },
-        { title: "Pending Queue", value: dashboard.fileStats.processing.toLocaleString(), change: `${dashboard.fileStats.failed} failed`, icon: Clock, color: "text-orange-500" },
+        { title: "Pending Queue", value: dashboard.fileStats.pending.toLocaleString(), change: `${dashboard.fileStats.failed} failed`, icon: Clock, color: "text-orange-500" },
         { title: "Flagged Records", value: dashboard.voterStats.flagged.toLocaleString(), change: `${dashboard.voterStats.incomplete} incomplete`, icon: AlertCircle, color: "text-red-500" },
       ]
     : [];
