@@ -9,7 +9,8 @@ import {
   Database,
   ChevronLeft,
   Menu,
-  LogOut
+  LogOut,
+  BarChart3
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
@@ -20,6 +21,7 @@ const sidebarItems = [
   { icon: UploadCloud, label: "Batch Upload", href: "/upload" },
   { icon: FileText, label: "Processing Queue", href: "/processing" },
   { icon: Database, label: "Data Records", href: "/records" },
+  { icon: BarChart3, label: "Analytics Engine", href: "/analytics" },
   { icon: ShieldCheck, label: "Audit Logs", href: "/audit" },
   { icon: Settings, label: "System Settings", href: "/settings" },
 ];

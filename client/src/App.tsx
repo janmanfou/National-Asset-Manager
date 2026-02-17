@@ -6,6 +6,7 @@ import Processing from "@/pages/processing";
 import Records from "@/pages/records";
 import Audit from "@/pages/audit";
 import Settings from "@/pages/settings";
+import Analytics from "@/pages/analytics";
 import Auth from "@/pages/auth";
 import NotFound from "@/pages/not-found";
 import { useEffect, useState } from "react";
@@ -49,6 +50,7 @@ function AppContent() {
           <Route path="/upload" component={Upload} />
           <Route path="/processing" component={Processing} />
           <Route path="/records" component={Records} />
+          <Route path="/analytics" component={Analytics} />
           <Route path="/audit" component={Audit} />
           <Route path="/settings" component={Settings} />
           <Route path="/auth" component={() => {
