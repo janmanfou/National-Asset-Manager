@@ -10,8 +10,10 @@ import Auth from "@/pages/auth";
 import NotFound from "@/pages/not-found";
 import { useEffect, useState } from "react";
 import { Toaster } from "@/components/ui/toaster";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "@/lib/queryClient";
 
-function App() {
+function AppContent() {
   const [location, setLocation] = useLocation();
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
 
@@ -28,17 +30,13 @@ function App() {
 
   if (!isAuthenticated) {
     return (
-      <>
-        <Switch>
-          <Route path="/auth" component={Auth} />
-          <Route component={() => {
-             // Redirect any other route to auth
-             useEffect(() => setLocation("/auth"), []);
-             return null;
-          }} />
-        </Switch>
-        <Toaster />
-      </>
+      <Switch>
+        <Route path="/auth" component={Auth} />
+        <Route component={() => {
+            useEffect(() => setLocation("/auth"), [setLocation]);
+            return null;
+        }} />
+      </Switch>
     );
   }
 
@@ -53,16 +51,23 @@ function App() {
           <Route path="/records" component={Records} />
           <Route path="/audit" component={Audit} />
           <Route path="/settings" component={Settings} />
-          {/* Allow accessing auth page to re-login if needed, or redirect back */}
           <Route path="/auth" component={() => {
-             useEffect(() => setLocation("/"), []);
-             return null;
+              useEffect(() => setLocation("/"), [setLocation]);
+              return null;
           }} />
           <Route component={NotFound} />
         </Switch>
       </main>
-      <Toaster />
     </div>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AppContent />
+      <Toaster />
+    </QueryClientProvider>
   );
 }
 

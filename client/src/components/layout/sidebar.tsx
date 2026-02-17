@@ -60,9 +60,9 @@ export function Sidebar() {
               <nav className="flex flex-col gap-2 flex-1">
                 {sidebarItems.map((item) => (
                   <Link key={item.href} href={item.href}>
-                    <a
+                    <div
                       className={cn(
-                        "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors",
+                        "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors cursor-pointer",
                         location === item.href
                           ? "bg-sidebar-primary text-sidebar-primary-foreground font-medium"
                           : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground text-sidebar-foreground/70"
@@ -70,7 +70,7 @@ export function Sidebar() {
                     >
                       <item.icon className="h-4 w-4" />
                       <span>{item.label}</span>
-                    </a>
+                    </div>
                   </Link>
                 ))}
               </nav>
@@ -119,9 +119,9 @@ export function Sidebar() {
         <nav className="flex-1 p-2 space-y-1 overflow-y-auto">
           {sidebarItems.map((item) => (
             <Link key={item.href} href={item.href}>
-              <a
+              <div
                 className={cn(
-                  "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors group relative",
+                  "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors group relative cursor-pointer",
                   location === item.href
                     ? "bg-sidebar-primary text-sidebar-primary-foreground font-medium"
                     : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground text-sidebar-foreground/70",
@@ -131,7 +131,7 @@ export function Sidebar() {
               >
                 <item.icon className="h-5 w-5 shrink-0" />
                 {!collapsed && <span>{item.label}</span>}
-              </a>
+              </div>
             </Link>
           ))}
         </nav>
