@@ -40,11 +40,11 @@ export default function Auth() {
           <CardContent className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="email">Email or Username</Label>
-              <Input id="email" type="text" placeholder="admin@ec.gov.in" required />
+              <Input id="email" type="text" defaultValue="admin@ec.gov.in" required />
             </div>
             <div className="space-y-2">
               <Label htmlFor="password">Password</Label>
-              <Input id="password" type="password" required />
+              <Input id="password" type="password" defaultValue="password" required />
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
           </CardContent>
