@@ -9,27 +9,31 @@ import Settings from "@/pages/settings";
 import Analytics from "@/pages/analytics";
 import Auth from "@/pages/auth";
 import NotFound from "@/pages/not-found";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Toaster } from "@/components/ui/toaster";
-import { QueryClientProvider } from "@tanstack/react-query";
-import { queryClient } from "@/lib/queryClient";
+import { QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { queryClient, getQueryFn } from "@/lib/queryClient";
+import { Loader2 } from "lucide-react";
 
 function AppContent() {
   const [location, setLocation] = useLocation();
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
 
-  useEffect(() => {
-    const auth = localStorage.getItem("voter_auth");
-    setIsAuthenticated(!!auth);
-    
-    if (!auth && location !== "/auth") {
-      setLocation("/auth");
-    }
-  }, [location, setLocation]);
+  const { data: user, isLoading, error } = useQuery({
+    queryKey: ["/api/auth/me"],
+    queryFn: getQueryFn({ on401: "returnNull" }),
+    retry: false,
+    staleTime: 0,
+  });
 
-  if (isAuthenticated === null) return null; // Loading state
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
 
-  if (!isAuthenticated) {
+  if (!user) {
     return (
       <Switch>
         <Route path="/auth" component={Auth} />

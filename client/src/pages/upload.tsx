@@ -1,11 +1,12 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { UploadCloud, FileArchive, Zap, ShieldCheck } from "lucide-react";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { useLocation } from "wouter";
 import { UploadItem, StorageWidget } from "@/components/upload/upload-components";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
+import { queryClient } from "@/lib/queryClient";
 
 interface UploadingFile {
   file: File;
@@ -21,42 +22,6 @@ export default function Upload() {
   const [uploads, setUploads] = useState<UploadingFile[]>([]);
   const [, setLocation] = useLocation();
   const [autoProcess, setAutoProcess] = useState(true);
-
-  // Simulation effect for upload progress
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setUploads(current => 
-        current.map(upload => {
-          if (upload.status !== "uploading") return upload;
-
-          let newProgress = upload.progress + (Math.random() * 2); // Random increment
-          let newStatus = upload.status;
-          
-          if (newProgress >= 100) {
-            newProgress = 100;
-            newStatus = "merging";
-            // Chain the next steps
-            setTimeout(() => {
-              setUploads(curr => curr.map(u => u.id === upload.id ? { ...u, status: "extracting", progress: 100 } : u));
-              setTimeout(() => {
-                setUploads(curr => curr.map(u => u.id === upload.id ? { ...u, status: "completed", progress: 100 } : u));
-              }, 2000);
-            }, 1500);
-          }
-
-          return {
-            ...upload,
-            progress: newProgress,
-            speed: `${(Math.random() * 5 + 8).toFixed(1)} MB/s`, // Simulate fluctuating speed
-            eta: `${Math.max(0, Math.floor((100 - newProgress) / 2))}s`,
-            status: newStatus
-          };
-        })
-      );
-    }, 500);
-
-    return () => clearInterval(interval);
-  }, []);
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -84,6 +49,64 @@ export default function Upload() {
     }
   };
 
+  const uploadFile = (file: File, id: string) => {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append("file", file);
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        const percent = (e.loaded / e.total) * 100;
+        const speedMb = (e.loaded / 1024 / 1024 / (Date.now() / 1000)).toFixed(1);
+        const remaining = e.total - e.loaded;
+        const etaSec = Math.max(0, Math.floor(remaining / (e.loaded / (Date.now() / 1000)) ));
+        setUploads(prev => prev.map(u => u.id === id ? {
+          ...u,
+          progress: Math.min(percent, 99),
+          speed: `${speedMb} MB/s`,
+          eta: `${etaSec}s`,
+        } : u));
+      }
+    });
+
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        setUploads(prev => prev.map(u => u.id === id ? {
+          ...u,
+          progress: 100,
+          status: "completed" as const,
+          speed: "Done",
+          eta: "0s",
+        } : u));
+        queryClient.invalidateQueries({ queryKey: ["/api/files"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/audit"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/analytics/dashboard"] });
+      } else {
+        setUploads(prev => prev.map(u => u.id === id ? {
+          ...u,
+          status: "error" as const,
+          speed: "Failed",
+          eta: "",
+        } : u));
+      }
+    });
+
+    xhr.addEventListener("error", () => {
+      setUploads(prev => prev.map(u => u.id === id ? {
+        ...u,
+        status: "error" as const,
+        speed: "Failed",
+        eta: "",
+      } : u));
+    });
+
+    xhr.open("POST", "/api/files/upload");
+    xhr.withCredentials = true;
+    xhr.send(formData);
+
+    return xhr;
+  };
+
   const addFiles = (files: File[]) => {
     const newUploads = files
       .filter(file => 
@@ -92,25 +115,20 @@ export default function Upload() {
         file.type === "application/x-zip-compressed" ||
         file.name.endsWith(".zip")
       )
-      .map(file => ({
-        file,
-        progress: 0,
-        speed: "0 MB/s",
-        eta: "Calculating...",
-        status: "uploading" as const,
-        id: Math.random().toString(36).substr(2, 9)
-      }));
+      .map(file => {
+        const id = Math.random().toString(36).substr(2, 9);
+        uploadFile(file, id);
+        return {
+          file,
+          progress: 0,
+          speed: "Starting...",
+          eta: "Calculating...",
+          status: "uploading" as const,
+          id,
+        };
+      });
     
     setUploads(prev => [...prev, ...newUploads]);
-  };
-
-  const togglePause = (id: string) => {
-    setUploads(prev => prev.map(u => {
-      if (u.id === id) {
-        return { ...u, status: u.status === "uploading" ? "paused" : "uploading" };
-      }
-      return u;
-    }));
   };
 
   const cancelUpload = (id: string) => {
@@ -132,6 +150,7 @@ export default function Upload() {
               id="auto-process" 
               checked={autoProcess} 
               onCheckedChange={setAutoProcess} 
+              data-testid="switch-auto-process"
             />
             <Label htmlFor="auto-process" className="cursor-pointer text-sm font-medium">Auto-start Processing</Label>
           </div>
@@ -139,7 +158,6 @@ export default function Upload() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left Column: Upload Area */}
         <div className="lg:col-span-2 space-y-6">
           <Card className={`border-2 border-dashed transition-all duration-300 ${dragActive ? "border-primary bg-primary/5 scale-[1.01]" : "border-border hover:border-primary/50"}`}>
             <CardContent 
@@ -149,6 +167,7 @@ export default function Upload() {
               onDragOver={handleDrag} 
               onDrop={handleDrop}
               onClick={() => document.getElementById('file-upload')?.click()}
+              data-testid="dropzone"
             >
               <div className="absolute inset-0 bg-gradient-to-tr from-primary/5 to-transparent opacity-0 hover:opacity-100 transition-opacity" />
               
@@ -169,7 +188,7 @@ export default function Upload() {
                  <Button className="min-w-[140px] shadow-lg shadow-primary/20" onClick={(e) => {
                   e.stopPropagation();
                   document.getElementById('file-upload')?.click();
-                }}>
+                }} data-testid="button-browse">
                   Browse System
                 </Button>
               </div>
@@ -181,11 +200,11 @@ export default function Upload() {
                 multiple 
                 accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed"
                 onChange={handleChange}
+                data-testid="input-file"
               />
             </CardContent>
           </Card>
 
-          {/* Active Uploads List */}
           {uploads.length > 0 && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
@@ -196,7 +215,7 @@ export default function Upload() {
                   </span>
                 </h3>
                 {allCompleted && (
-                  <Button onClick={() => setLocation("/processing")} className="animate-in fade-in zoom-in">
+                  <Button onClick={() => setLocation("/processing")} className="animate-in fade-in zoom-in" data-testid="button-go-processing">
                     Go to Processing Dashboard
                   </Button>
                 )}
@@ -207,8 +226,8 @@ export default function Upload() {
                   <UploadItem 
                     key={upload.id}
                     {...upload}
-                    onPause={() => togglePause(upload.id)}
-                    onResume={() => togglePause(upload.id)}
+                    onPause={() => {}}
+                    onResume={() => {}}
                     onCancel={() => cancelUpload(upload.id)}
                   />
                 ))}
@@ -217,7 +236,6 @@ export default function Upload() {
           )}
         </div>
 
-        {/* Right Column: Stats & Info */}
         <div className="space-y-6">
           <StorageWidget />
 
