@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { UploadCloud, File, X, CheckCircle2 } from "lucide-react";
+import { UploadCloud, File, X, FileArchive } from "lucide-react";
 import { useState, useCallback } from "react";
 import { useLocation } from "wouter";
 
@@ -24,7 +24,12 @@ export default function Upload() {
     e.stopPropagation();
     setDragActive(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const newFiles = Array.from(e.dataTransfer.files).filter(file => file.type === "application/pdf");
+      const newFiles = Array.from(e.dataTransfer.files).filter(file => 
+        file.type === "application/pdf" || 
+        file.type === "application/zip" || 
+        file.type === "application/x-zip-compressed" ||
+        file.name.endsWith(".zip")
+      );
       setFiles(prev => [...prev, ...newFiles]);
     }
   }, []);
@@ -32,7 +37,12 @@ export default function Upload() {
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     e.preventDefault();
     if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files).filter(file => file.type === "application/pdf");
+      const newFiles = Array.from(e.target.files).filter(file => 
+        file.type === "application/pdf" || 
+        file.type === "application/zip" || 
+        file.type === "application/x-zip-compressed" ||
+        file.name.endsWith(".zip")
+      );
       setFiles(prev => [...prev, ...newFiles]);
     }
   };
@@ -50,7 +60,7 @@ export default function Upload() {
     <div className="p-8 max-w-5xl mx-auto animate-in fade-in duration-500 space-y-8">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Batch Upload</h1>
-        <p className="text-muted-foreground mt-1">Upload scanned electoral roll PDFs for processing.</p>
+        <p className="text-muted-foreground mt-1">Upload scanned electoral roll PDFs or Bulk ZIP archives for processing.</p>
       </div>
 
       <Card className={`border-2 border-dashed transition-colors ${dragActive ? "border-primary bg-primary/5" : "border-border"}`}>
@@ -65,8 +75,11 @@ export default function Upload() {
           <div className="p-4 rounded-full bg-primary/10 mb-4">
             <UploadCloud className="h-10 w-10 text-primary" />
           </div>
-          <h3 className="text-lg font-semibold mb-1">Drag and drop PDF files here</h3>
-          <p className="text-sm text-muted-foreground mb-4">Support for scanned Hindi/English electoral rolls</p>
+          <h3 className="text-lg font-semibold mb-1">Drag and drop PDF or ZIP files here</h3>
+          <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
+            Support for scanned Hindi/English electoral rolls. <br/>
+            <span className="font-medium text-primary">Bulk Upload:</span> ZIP archives supported up to <span className="font-bold">5GB</span>.
+          </p>
           <Button variant="outline" className="mt-2" onClick={(e) => {
             e.stopPropagation();
             document.getElementById('file-upload')?.click();
@@ -78,7 +91,7 @@ export default function Upload() {
             type="file" 
             className="hidden" 
             multiple 
-            accept=".pdf"
+            accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed"
             onChange={handleChange}
           />
         </CardContent>
@@ -95,7 +108,11 @@ export default function Upload() {
               {files.map((file, i) => (
                 <div key={i} className="flex items-center justify-between p-3 border rounded-md bg-muted/30">
                   <div className="flex items-center gap-3">
-                    <File className="h-5 w-5 text-blue-500" />
+                    {file.name.endsWith('.zip') ? (
+                      <FileArchive className="h-5 w-5 text-orange-500" />
+                    ) : (
+                      <File className="h-5 w-5 text-blue-500" />
+                    )}
                     <div>
                       <p className="text-sm font-medium">{file.name}</p>
                       <p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
