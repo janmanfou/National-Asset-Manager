@@ -8,7 +8,7 @@ import {
   StrategyCard,
   PriorityBoothList
 } from "@/components/analytics/charts";
-import { Download, Share2, Printer, Map, Zap, Target } from "lucide-react";
+import { Download, Share2, Printer, Map, Zap, Target, Users } from "lucide-react";
 
 export default function Analytics() {
   return (
