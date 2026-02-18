@@ -8,8 +8,8 @@ import { hindiToEnglish } from "./transliterate";
 
 const execAsync = promisify(exec);
 const TEMP_DIR = "/tmp/ocr_processing";
-const CONCURRENCY = 4;
-const DPI = 150;
+const CONCURRENCY = 1;
+const DPI = 100;
 const PAGE_PARALLELISM = 2;
 
 const activeProcessing = new Set<string>();
@@ -328,8 +328,8 @@ function parseVotersFallback(ocrText: string): ParsedVoter[] {
 async function ocrPageAsync(imagePath: string): Promise<string> {
   try {
     const { stdout } = await execAsync(
-      `tesseract "${imagePath}" stdout -l hin+eng 2>/dev/null`,
-      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+      `tesseract "${imagePath}" stdout -l hin --oem 1 --psm 4 2>/dev/null`,
+      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
     );
     return stdout;
   } catch (e: any) {
@@ -396,7 +396,7 @@ async function processOnePdf(
 
   try {
     await execAsync(
-      `pdftoppm -r ${DPI} -png "${pdfPath}" "${path.join(imgDir, 'p')}"`,
+      `pdftoppm -r ${DPI} -gray -png "${pdfPath}" "${path.join(imgDir, 'p')}"`,
       { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }
     );
   } catch (e: any) {
@@ -601,10 +601,23 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
       return;
     }
 
+    const fileRecord = await storage.getFile(fileId);
+    const alreadyProcessed = fileRecord?.pagesProcessed ?? 0;
+    const alreadyExtracted = fileRecord?.extractedCount ?? 0;
+    const isResume = alreadyProcessed > 0 && alreadyProcessed < validPdfs.length;
+
+    if (isResume) {
+      console.log(`[OCR] RESUMING from PDF ${alreadyProcessed + 1}/${validPdfs.length} (${alreadyExtracted} voters already extracted)`);
+      validPdfs.splice(0, alreadyProcessed);
+    } else {
+      await storage.deleteVoterRecordsByFileId(fileId);
+      console.log(`[OCR] Cleared old records, starting fresh insert`);
+    }
+
     await storage.updateFile(fileId, {
       totalPages: totalFound,
       skippedPages: skippedPdfs.length,
-      processingStartedAt: new Date(),
+      processingStartedAt: isResume ? (fileRecord?.processingStartedAt ?? new Date()) : new Date(),
     });
 
     const defaultHeader: PdfHeaderInfo = {
@@ -623,87 +636,63 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
       jilla: "",
     };
 
-    let totalVoters = 0;
-    let processedCount = 0;
+    let totalVoters = isResume ? alreadyExtracted : 0;
+    let processedCount = isResume ? alreadyProcessed : 0;
     let failedPdfs: string[] = [];
 
     const startTime = Date.now();
 
-    const firstResult = await processOnePdf(validPdfs[0], fileId, 0, 0, defaultHeader);
-    if (firstResult.headerInfo && firstResult.headerInfo.acNoName) {
-      defaultHeader.acNoName = firstResult.headerInfo.acNoName;
-    }
+    console.log(`[OCR] Starting parallel processing: ${validPdfs.length} PDFs with CONCURRENCY=${CONCURRENCY}, PAGE_PARALLELISM=${PAGE_PARALLELISM}, DPI=${DPI}`);
 
-    await storage.deleteVoterRecordsByFileId(fileId);
-    console.log(`[OCR] Cleared old records, starting fresh insert`);
+    await processInParallel(validPdfs, CONCURRENCY, async (pdfPath, idx) => {
+      if (!activeProcessing.has(fileId)) return;
+      const pdfName = path.basename(pdfPath);
+      try {
+        const result = await processOnePdf(pdfPath, fileId, idx, 0, defaultHeader);
 
-    if (firstResult.voters.length > 0) {
-      await insertVoterBatch(firstResult.voters);
-      totalVoters += firstResult.voters.length;
-    }
-    processedCount = 1;
-    try { fs.unlinkSync(validPdfs[0]); } catch {}
-
-    const firstPdfTime = Date.now() - startTime;
-    const avgTimePerPdf = firstPdfTime;
-    console.log(`[OCR] Progress: 1/${validPdfs.length} PDFs (0%) | ${totalVoters} voters | ${(firstPdfTime/1000).toFixed(1)}s for first PDF`);
-
-    await storage.updateFile(fileId, {
-      pagesProcessed: 1,
-      progress: Math.min(Math.floor((1 / validPdfs.length) * 100), 99),
-      extractedCount: totalVoters,
-      avgPageTimeMs: avgTimePerPdf,
-    });
-
-    const remainingPdfs = validPdfs.slice(1);
-    if (remainingPdfs.length > 0) {
-      await processInParallel(remainingPdfs, CONCURRENCY, async (pdfPath, idx) => {
-        const pdfName = path.basename(pdfPath);
-        const pdfStart = Date.now();
-        try {
-          const result = await processOnePdf(pdfPath, fileId, idx + 1, 0, defaultHeader);
-
-          if (result.headerInfo && !defaultHeader.acNoName && result.headerInfo.acNoName) {
-            defaultHeader.acNoName = result.headerInfo.acNoName;
-          }
-
-          if (result.voters.length > 0) {
-            await insertVoterBatch(result.voters);
-            totalVoters += result.voters.length;
-          }
-
-          processedCount++;
-          const progress = Math.floor((processedCount / validPdfs.length) * 100);
-          const elapsed = (Date.now() - startTime) / 1000;
-          const rate = processedCount / (elapsed / 3600);
-          const avgMs = Math.floor(elapsed * 1000 / processedCount);
-
-          if (processedCount % 3 === 0 || processedCount <= 3) {
-            const remaining = validPdfs.length - processedCount;
-            const etaMin = ((remaining * avgMs / CONCURRENCY) / 1000 / 60).toFixed(1);
-            console.log(`[OCR] Progress: ${processedCount}/${validPdfs.length} PDFs (${progress}%) | ${totalVoters} voters | ${rate.toFixed(0)} PDFs/hr | ETA: ${etaMin}m`);
-          }
-
-          await storage.updateFile(fileId, {
-            pagesProcessed: processedCount,
-            progress: Math.min(progress, 99),
-            extractedCount: totalVoters,
-            avgPageTimeMs: Math.floor(elapsed * 1000 / processedCount),
-          });
-        } catch (e: any) {
-          failedPdfs.push(pdfName);
-          processedCount++;
-          console.error(`[OCR] Failed PDF ${pdfName}: ${e.message?.substring(0, 100)}`);
+        if (result.headerInfo && !defaultHeader.acNoName && result.headerInfo.acNoName) {
+          defaultHeader.acNoName = result.headerInfo.acNoName;
         }
 
-        try { fs.unlinkSync(pdfPath); } catch {}
-      });
-    }
+        if (result.voters.length > 0) {
+          await insertVoterBatch(result.voters);
+          totalVoters += result.voters.length;
+        }
+
+        processedCount++;
+        const originalTotal = totalFound - skippedPdfs.length;
+        const progress = Math.floor((processedCount / originalTotal) * 100);
+        const sessionProcessed = processedCount - (isResume ? alreadyProcessed : 0);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const sessionRate = sessionProcessed > 0 ? sessionProcessed / (elapsed / 3600) : 0;
+        const avgMs = sessionProcessed > 0 ? Math.floor(elapsed * 1000 / sessionProcessed) : 0;
+
+        if (processedCount % 5 === 0 || processedCount <= 5 || (isResume && sessionProcessed <= 3)) {
+          const remaining = originalTotal - processedCount;
+          const etaMin = avgMs > 0 ? ((remaining * avgMs / CONCURRENCY) / 1000 / 60).toFixed(1) : '?';
+          console.log(`[OCR] Progress: ${processedCount}/${originalTotal} PDFs (${progress}%) | ${totalVoters} voters | ${sessionRate.toFixed(0)} PDFs/hr | ETA: ${etaMin}m`);
+        }
+
+        await storage.updateFile(fileId, {
+          pagesProcessed: processedCount,
+          progress: Math.min(progress, 99),
+          extractedCount: totalVoters,
+          avgPageTimeMs: avgMs > 0 ? avgMs : (fileRecord?.avgPageTimeMs ?? 0),
+        });
+      } catch (e: any) {
+        failedPdfs.push(pdfName);
+        processedCount++;
+        console.error(`[OCR] Failed PDF ${pdfName}: ${e.message?.substring(0, 100)}`);
+      }
+
+      try { fs.unlinkSync(pdfPath); } catch {}
+    });
 
     const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-    const finalRate = (validPdfs.length / ((Date.now() - startTime) / 1000 / 3600)).toFixed(0);
+    const originalTotal = totalFound - skippedPdfs.length;
+    const finalRate = (originalTotal / ((Date.now() - startTime) / 1000 / 3600)).toFixed(0);
 
-    console.log(`[OCR] COMPLETE: ${validPdfs.length} PDFs in ${totalTime} min | ${totalVoters} voters | ${finalRate} PDFs/hr`);
+    console.log(`[OCR] COMPLETE: ${originalTotal} PDFs in ${totalTime} min | ${totalVoters} voters | ${finalRate} PDFs/hr`);
     if (failedPdfs.length > 0) {
       console.log(`[OCR] Failed PDFs (${failedPdfs.length}): ${failedPdfs.slice(0, 20).join(", ")}`);
     }
@@ -715,7 +704,7 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     await storage.updateFile(fileId, {
       status: "completed",
       progress: 100,
-      pagesProcessed: validPdfs.length,
+      pagesProcessed: originalTotal,
       extractedCount: totalVoters,
       totalPages: totalFound,
       skippedPages: skippedPdfs.length,

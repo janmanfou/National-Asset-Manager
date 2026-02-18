@@ -585,11 +585,19 @@ export async function registerRoutes(
   try {
     const files = await storage.getFiles();
     for (const file of files) {
-      if (file.status === "processing" || file.status === "uploading") {
-        console.log(`Recovering interrupted file: ${file.originalName} (was ${file.status})`);
+      if (file.status === "processing" || (file.status === "pending" && (file.pagesProcessed ?? 0) > 0 && (file.pagesProcessed ?? 0) < (file.totalPages ?? 0))) {
+        console.log(`Auto-resuming interrupted file: ${file.originalName} (${file.pagesProcessed}/${file.totalPages} PDFs done, ${file.extractedCount} voters)`);
+        await storage.updateFile(file.id, {
+          status: "processing",
+          errorMessage: null,
+        });
+        setTimeout(() => {
+          startProcessing(file.id, file.filename, file.originalName);
+        }, 3000);
+      } else if (file.status === "uploading") {
         await storage.updateFile(file.id, {
           status: "failed",
-          errorMessage: "Processing was interrupted by server restart. Click Reprocess to try again.",
+          errorMessage: "Upload was interrupted by server restart. Please re-upload the file.",
         });
       }
     }
