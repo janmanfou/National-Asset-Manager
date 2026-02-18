@@ -279,7 +279,7 @@ async function processOnePdfWithGemini(
   const allVoters: InsertVoter[] = [];
   let extractedHeader: PdfHeaderInfo | null = null;
 
-  const processPage = async (imgPath: string): Promise<GeminiPageResult> => {
+  const processPage = async (imgPath: string, _idx: number): Promise<GeminiPageResult> => {
     const result = await extractPageWithGemini(imgPath);
     try { fs.unlinkSync(imgPath); } catch {}
     return result;
@@ -322,7 +322,7 @@ async function processOnePdfWithGemini(
 async function processWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
-  processor: (item: T) => Promise<R>
+  processor: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let nextIndex = 0;
@@ -330,7 +330,8 @@ async function processWithConcurrency<T, R>(
   async function worker() {
     while (nextIndex < items.length) {
       const idx = nextIndex++;
-      results[idx] = await processor(items[idx]);
+      if (idx >= items.length) break;
+      results[idx] = await processor(items[idx], idx);
     }
   }
 
@@ -453,18 +454,19 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     };
 
     let totalVoters = isResume ? alreadyExtracted : 0;
-    let processedCount = isResume ? alreadyProcessed : 0;
+    let completedCount = 0;
+    const baseProcessed = isResume ? alreadyProcessed : 0;
     let failedPdfs: string[] = [];
     const startTime = Date.now();
     const originalTotal = totalFound - skippedPdfs.length;
 
     console.log(`[OCR] Starting Gemini AI processing: ${validPdfs.length} PDFs, PDF_CONCURRENCY=${PDF_CONCURRENCY}, GEMINI_CONCURRENCY=${GEMINI_CONCURRENCY}`);
 
-    await processWithConcurrency(validPdfs, PDF_CONCURRENCY, async (pdfPath) => {
+    await processWithConcurrency(validPdfs, PDF_CONCURRENCY, async (pdfPath, idx) => {
       if (!activeProcessing.has(fileId)) return;
       const pdfName = path.basename(pdfPath);
       try {
-        const result = await processOnePdfWithGemini(pdfPath, fileId, processedCount, defaultHeader);
+        const result = await processOnePdfWithGemini(pdfPath, fileId, idx, defaultHeader);
 
         if (result.headerInfo && !defaultHeader.acNoName && result.headerInfo.acNoName) {
           defaultHeader.acNoName = result.headerInfo.acNoName;
@@ -479,14 +481,14 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
           totalVoters += result.voters.length;
         }
 
-        processedCount++;
+        completedCount++;
+        const processedCount = baseProcessed + completedCount;
         const progress = Math.floor((processedCount / originalTotal) * 100);
-        const sessionProcessed = processedCount - (isResume ? alreadyProcessed : 0);
         const elapsed = (Date.now() - startTime) / 1000;
-        const sessionRate = sessionProcessed > 0 ? sessionProcessed / (elapsed / 3600) : 0;
-        const avgMs = sessionProcessed > 0 ? Math.floor(elapsed * 1000 / sessionProcessed) : 0;
+        const sessionRate = completedCount > 0 ? completedCount / (elapsed / 3600) : 0;
+        const avgMs = completedCount > 0 ? Math.floor(elapsed * 1000 / completedCount) : 0;
 
-        if (processedCount % 10 === 0 || processedCount <= 5 || processedCount === originalTotal) {
+        if (completedCount % 10 === 0 || completedCount <= 5 || processedCount === originalTotal) {
           const remaining = originalTotal - processedCount;
           const etaMin = avgMs > 0 ? ((remaining * avgMs / PDF_CONCURRENCY) / 1000 / 60).toFixed(1) : '?';
           console.log(`[OCR] Progress: ${processedCount}/${originalTotal} PDFs (${progress}%) | ${totalVoters} voters | ${sessionRate.toFixed(0)} PDFs/hr | ETA: ${etaMin}m`);
@@ -500,7 +502,7 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
         });
       } catch (e: any) {
         failedPdfs.push(pdfName);
-        processedCount++;
+        completedCount++;
         console.error(`[OCR] Failed PDF ${pdfName}: ${e.message?.substring(0, 100)}`);
       }
 
