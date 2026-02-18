@@ -1,16 +1,25 @@
-import { exec, execSync } from "child_process";
+import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
 import path from "path";
 import { storage } from "./storage";
 import type { InsertVoter } from "@shared/schema";
 import { hindiToEnglish } from "./transliterate";
+import { GoogleGenAI } from "@google/genai";
 
 const execAsync = promisify(exec);
 const TEMP_DIR = "/tmp/ocr_processing";
-const CONCURRENCY = 1;
-const DPI = 100;
-const PAGE_PARALLELISM = 2;
+const DPI = 150;
+const GEMINI_CONCURRENCY = 5;
+const PDF_CONCURRENCY = 3;
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY,
+  httpOptions: {
+    apiVersion: "",
+    baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL,
+  },
+});
 
 const activeProcessing = new Set<string>();
 
@@ -39,7 +48,6 @@ interface PdfHeaderInfo {
   sectionName: string;
   psName: string;
   state: string;
-  totalVoters: string;
   gram: string;
   thana: string;
   panchayat: string;
@@ -48,344 +56,193 @@ interface PdfHeaderInfo {
   jilla: string;
 }
 
-interface ParsedVoter {
-  serialNumber: number;
-  epicNumber: string;
-  voterName: string;
+interface GeminiVoter {
+  serial: number;
+  epic: string;
+  name: string;
   relationType: string;
   relationName: string;
-  houseNo: string;
+  house: string;
   age: number;
   gender: string;
 }
 
-function parseLocationBlock(ocrText: string, info: PdfHeaderInfo): void {
-  const colonVal = /[:：<;\.\$4]\s*/;
-
-  const tryInline = (label: RegExp) => {
-    const re = new RegExp(label.source + `\\s*${colonVal.source}([^\\n]+)`, label.flags);
-    const m = ocrText.match(re);
-    return m ? m[1].trim() : "";
+interface GeminiPageResult {
+  header?: {
+    acNoName?: string;
+    partNumber?: string;
+    sectionNumber?: string;
+    sectionName?: string;
+    psName?: string;
+    gram?: string;
+    thana?: string;
+    panchayat?: string;
+    block?: string;
+    tahsil?: string;
+    jilla?: string;
   };
-
-  info.gram = tryInline(/(?:मुख्य\s*)?(?:कस्बा\s*)?(?:अथवा\s*)?ग्राम/) || tryInline(/[ईE][\.\s]*[T7][\.\s]*अथवा\s*ग्राम/);
-  info.thana = tryInline(/थाना/);
-  info.panchayat = tryInline(/पंचायत/);
-  info.block = tryInline(/ब्लॉक/);
-  info.tahsil = tryInline(/तहसील/);
-  info.jilla = tryInline(/जिला/);
-
-  if (info.gram || info.thana || info.panchayat || info.block || info.tahsil || info.jilla) {
-    return;
-  }
-
-  const lines = ocrText.split("\n");
-
-  let blockStartLine = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes("ग्राम") || lines[i].match(/[ईE][\.\s]*[T7][\.\s]*अथवा/)) {
-      blockStartLine = i;
-      break;
-    }
-  }
-  if (blockStartLine < 0) return;
-
-  const afterBlock = lines.slice(blockStartLine).join("\n");
-
-  const valPattern = /[:：<;\$4]\s*([^\n]+)/g;
-  const allValues: string[] = [];
-  let vm;
-  while ((vm = valPattern.exec(afterBlock)) !== null) {
-    const val = vm[1].trim();
-    if (val.length > 0 && !val.includes("मतदान") && !val.includes("निर्वाचक") && !val.includes("सामान्य")) {
-      allValues.push(val);
-    }
-    if (allValues.length >= 9) break;
-  }
-
-  if (allValues.length >= 1) info.gram = allValues[0] || "";
-  if (allValues.length >= 3) info.thana = allValues[2] || "";
-  if (allValues.length >= 4) info.panchayat = allValues[3] || "";
-  if (allValues.length >= 5) info.block = allValues[4] || "";
-  if (allValues.length >= 6) info.tahsil = allValues[5] || "";
-  if (allValues.length >= 7) info.jilla = allValues[6] || "";
+  voters: GeminiVoter[];
 }
 
-function parseHeaderPage(ocrText: string): PdfHeaderInfo {
-  const info: PdfHeaderInfo = {
-    acNoName: "",
-    partNumber: "",
-    sectionNumber: "",
-    sectionName: "",
-    psName: "",
-    state: "Uttar Pradesh",
-    totalVoters: "",
-    gram: "",
-    thana: "",
-    panchayat: "",
-    block: "",
-    tahsil: "",
-    jilla: "",
-  };
+const EXTRACTION_PROMPT = `You are extracting voter data from an Indian electoral roll page in Hindi. Extract ALL voter entries visible on this page.
 
-  const acMatch = ocrText.match(/विधानसभा\s*निर्वाचन\s*क्षेत्र\s*(?:की\s*)?(?:संख्या\s*(?:व|और)\s*नाम\s*(?:और\s*आरक्षण\s*स्थिति\s*)?)?[:：]?\s*(\d+)\s*[-–]\s*([^\n(]+)/);
-  if (acMatch) {
-    info.acNoName = `${acMatch[1]}-${acMatch[2].trim()}`;
-  }
+For EACH voter, extract:
+- serial: Serial number (integer)
+- epic: EPIC/voter ID number (like ABC1234567 or UP/xx/xxx/xxxxx)
+- name: Voter's name in Hindi (exactly as written)
+- relationType: "Father" or "Husband" or "Mother" or "Other" (based on पिता/पति/माता/अन्य)
+- relationName: Father/Husband/Mother name in Hindi (exactly as written)
+- house: House number (मकान संख्या)
+- age: Age (integer, 18-120)
+- gender: "M" for पुरुष, "F" for महिला, "O" for अन्य
 
-  const partMatch = ocrText.match(/भाग\s*संख्या\s*[:：]\s*[:：]?\s*(\d+)/);
-  if (partMatch) {
-    info.partNumber = partMatch[1];
-  }
+Also extract header/location info if visible on this page (first page usually has it):
+- acNoName: Assembly constituency number and name (विधानसभा निर्वाचन क्षेत्र)
+- partNumber: Part number (भाग संख्या)  
+- sectionNumber: Section number
+- sectionName: Section name
+- psName: Polling station name (मतदान स्थल)
+- gram: Village/town (ग्राम/कस्बा)
+- thana: Police station (थाना)
+- panchayat: Panchayat name
+- block: Block name (ब्लॉक)
+- tahsil: Tahsil name (तहसील)
+- jilla: District name (जिला)
 
-  const sectionMatch = ocrText.match(/अनुभाग(?:ों)?\s*(?:की\s*)?(?:संख्या\s*(?:और|व)\s*नाम\s*)?[:：]\s*\n?\s*(\d+)[-–]([^\n]+)/);
-  if (sectionMatch) {
-    info.sectionNumber = sectionMatch[1].trim();
-    info.sectionName = sectionMatch[2].trim();
-  }
+Return ONLY valid JSON (no markdown, no backticks):
+{"header":{"acNoName":"","partNumber":"","sectionNumber":"","sectionName":"","psName":"","gram":"","thana":"","panchayat":"","block":"","tahsil":"","jilla":""},"voters":[{"serial":1,"epic":"ABC1234567","name":"नाम","relationType":"Father","relationName":"पिता का नाम","house":"123","age":45,"gender":"M"}]}
 
-  const psMatch = ocrText.match(/मतदान\s*स्थल\s*(?:की\s*)?(?:संख्या\s*(?:और|व)\s*नाम\s*)?[:：]\s*(?:सामान्य\s*)?[-–]?\s*([^\n]+)/);
-  if (psMatch) {
-    const ps = psMatch[1].replace(/इस\s*भाग.*$/, "").trim();
-    if (ps.length > 3) info.psName = ps;
-  }
-  if (!info.psName) {
-    const psMatch2 = ocrText.match(/मतदान\s*स्थल\s*का\s*पता\s*[:：]?\s*\n?\s*([^\n]+)/);
-    if (psMatch2) info.psName = psMatch2[1].trim();
-  }
+If no voters are found (e.g. cover page, blank page), return: {"voters":[]}
+If header info is not on this page, omit the "header" field.
+Extract ALL voters you can see. Be thorough - do not skip any entries.`;
 
-  parseLocationBlock(ocrText, info);
+async function extractPageWithGemini(imagePath: string, retries = 3): Promise<GeminiPageResult> {
+  const imageData = fs.readFileSync(imagePath);
+  const base64 = imageData.toString("base64");
 
-  return info;
-}
-
-function parseVoterBlocks(ocrText: string): ParsedVoter[] {
-  const voters: ParsedVoter[] = [];
-
-  const blocks = ocrText.split(/(?=\d+\s*[\]|\|]?\s*[A-Z]{2,3}\d{4,10}|\d+\s*[\]|\|]?\s*UP\/)/);
-
-  for (const block of blocks) {
-    if (block.trim().length < 20) continue;
-
-    const epicMatch = block.match(/(\d+)\s*[\]|\|]?\s*([A-Z]{2,3}\d{4,10}|UP\/\d+\/\d+\/\d+)/);
-    if (!epicMatch) continue;
-
-    const serialNumber = parseInt(epicMatch[1]);
-    const epicNumber = epicMatch[2];
-
-    if (isNaN(serialNumber) || serialNumber < 1 || serialNumber > 3000) continue;
-
-    let voterName = "";
-    const nameMatch = block.match(/(?<![पिता|पति|माता|अन्य]\s*(?:का\s*)?)नाम\s*[:：]\s*([^\n]+)/);
-    if (nameMatch) {
-      voterName = nameMatch[1]
-        .replace(/\s*(नाम|पिता|पति|माता|अन्य|मकान|आयु|लिंग|फोटो|उपलब्ध|[:：]).*$/, "")
-        .trim();
-    }
-    if (!voterName) {
-      const altName = block.match(/\b(?:नाम)\s*[:：]\s*([^\s]+(?:\s+[^\s]+)?)/);
-      if (altName) {
-        voterName = altName[1].replace(/\s*(नाम|पिता|पति|माता|अन्य|मकान|आयु|लिंग|फोटो|उपलब्ध).*$/, "").trim();
-      }
-    }
-
-    let relationType = "";
-    let relationName = "";
-    const relMatch = block.match(/(पिता|पति|माता|अन्य)\s*(?:का\s*)?नाम\s*[:：]\s*([^\n]+)/);
-    if (relMatch) {
-      relationType = relMatch[1] === "पिता" ? "Father"
-        : relMatch[1] === "पति" ? "Husband"
-        : relMatch[1] === "माता" ? "Mother"
-        : "Other";
-      relationName = relMatch[2]
-        .replace(/\s*(मकान|फोटो|आयु|लिंग|नाम|उपलब्ध|पिता|पति|माता|[:：]).*$/, "")
-        .trim();
-    }
-
-    let houseNo = "";
-    const houseMatch = block.match(/मकान\s*संख्या\s*[:；;]\s*(\S+)/);
-    if (houseMatch) {
-      houseNo = houseMatch[1].replace(/[|[\]{}()]/g, "").trim();
-    }
-
-    let age = 0;
-    let gender = "";
-    const ageMatch = block.match(/आयु\s*[:：]\s*(\d+)/);
-    if (ageMatch) {
-      const a = parseInt(ageMatch[1]);
-      if (a >= 18 && a <= 120) age = a;
-    }
-    const genderMatch = block.match(/लिंग\s*[:：]\s*(पुरुष|महिला|अन्य)/);
-    if (genderMatch) {
-      gender = genderMatch[1] === "पुरुष" ? "M" : genderMatch[1] === "महिला" ? "F" : "O";
-    }
-
-    if (!epicNumber && !voterName && age === 0) continue;
-
-    voters.push({
-      serialNumber,
-      epicNumber,
-      voterName: voterName || "Unknown",
-      relationType,
-      relationName,
-      houseNo,
-      age,
-      gender,
-    });
-  }
-
-  if (voters.length > 0) return voters;
-
-  return parseVotersFallback(ocrText);
-}
-
-function parseVotersFallback(ocrText: string): ParsedVoter[] {
-  const voters: ParsedVoter[] = [];
-
-  const epicPattern = /([A-Z]{2,3}\d{5,10}|UP\/\d+\/\d+\/\d+)/g;
-  const epics: string[] = [];
-  let m;
-  while ((m = epicPattern.exec(ocrText)) !== null) {
-    if (m[1].length >= 6) epics.push(m[1]);
-  }
-
-  const ageGenders: { age: number; gender: string }[] = [];
-  const agPattern = /आयु\s*[:：]\s*(\d+)\s*(?:.*?)लिंग\s*[:：]\s*(पुरुष|महिला|अन्य)/g;
-  while ((m = agPattern.exec(ocrText)) !== null) {
-    const age = parseInt(m[1]);
-    if (age >= 18 && age <= 120) {
-      ageGenders.push({
-        age,
-        gender: m[2] === "पुरुष" ? "M" : m[2] === "महिला" ? "F" : "O",
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: EXTRACTION_PROMPT },
+              {
+                inlineData: {
+                  mimeType: "image/png",
+                  data: base64,
+                },
+              },
+            ],
+          },
+        ],
+        config: {
+          maxOutputTokens: 8192,
+          temperature: 0.1,
+        },
       });
+
+      const text = response.text || "";
+      const jsonStr = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+
+      try {
+        const parsed = JSON.parse(jsonStr);
+        return {
+          header: parsed.header || undefined,
+          voters: Array.isArray(parsed.voters) ? parsed.voters : [],
+        };
+      } catch {
+        const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            header: parsed.header || undefined,
+            voters: Array.isArray(parsed.voters) ? parsed.voters : [],
+          };
+        }
+        if (attempt < retries - 1) continue;
+        console.error(`[OCR] JSON parse failed for ${path.basename(imagePath)}: ${text.substring(0, 200)}`);
+        return { voters: [] };
+      }
+    } catch (e: any) {
+      const isRateLimit = e.message?.includes("429") || e.message?.includes("rate") || e.message?.includes("quota");
+      if (isRateLimit && attempt < retries - 1) {
+        const delay = Math.pow(2, attempt + 1) * 1000 + Math.random() * 1000;
+        console.log(`[OCR] Rate limited, waiting ${(delay / 1000).toFixed(1)}s before retry...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      if (attempt < retries - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      console.error(`[OCR] Gemini error for ${path.basename(imagePath)}: ${e.message?.substring(0, 200)}`);
+      return { voters: [] };
     }
   }
-
-  const allNames: string[] = [];
-  const voterNamePattern = /(?<!(पिता|पति|माता|अन्य)\s*(?:का\s*)?)नाम\s*[:：]\s*([^\n]+)/g;
-  while ((m = voterNamePattern.exec(ocrText)) !== null) {
-    if (m.index > 0) {
-      const before = ocrText.substring(Math.max(0, m.index - 20), m.index);
-      if (before.match(/(पिता|पति|माता|अन्य)\s*(?:का\s*)?$/)) continue;
-    }
-    if (ocrText.substring(Math.max(0, m.index - 5), m.index).match(/अनुभाग|निर्वाचन|नामावली/)) continue;
-    const cleaned = m[2]
-      .replace(/\s*(नाम|पिता|पति|माता|अन्य|मकान|आयु|लिंग|फोटो|उपलब्ध|[:：]).*$/, "")
-      .trim();
-    if (cleaned.length > 0 && cleaned.length < 40) {
-      allNames.push(cleaned);
-    }
-  }
-
-  const relations: { name: string; type: string }[] = [];
-  const relPattern = /(पिता|पति|माता|अन्य)\s*(?:का\s*)?नाम\s*[:：]\s*/g;
-  const relPositions: { pos: number; type: string; endOfMatch: number }[] = [];
-  while ((m = relPattern.exec(ocrText)) !== null) {
-    relPositions.push({ pos: m.index, type: m[1], endOfMatch: m.index + m[0].length });
-  }
-
-  for (let i = 0; i < relPositions.length; i++) {
-    const start = relPositions[i].endOfMatch;
-    const endBound = i + 1 < relPositions.length ? relPositions[i + 1].pos : ocrText.length;
-    const chunk = ocrText.substring(start, endBound);
-    const firstLine = chunk.split(/\n/)[0].trim();
-    const cleaned = firstLine
-      .replace(/\s*(मकान|फोटो|आयु|लिंग|नाम|पिता|पति|माता|अन्य|उपलब्ध|[:：]).*$/, "")
-      .trim();
-    if (cleaned.length > 0 && cleaned.length < 40) {
-      const type = relPositions[i].type === "पिता" ? "Father"
-        : relPositions[i].type === "पति" ? "Husband"
-        : relPositions[i].type === "माता" ? "Mother" : "Other";
-      relations.push({ name: cleaned, type });
-    }
-  }
-
-  const houseNumbers: string[] = [];
-  const housePattern = /मकान\s*संख्या\s*[:；;]\s*(\S+)/g;
-  while ((m = housePattern.exec(ocrText)) !== null) {
-    houseNumbers.push(m[1].replace(/[|[\]{}()]/g, "").trim());
-  }
-
-  const count = ageGenders.length;
-  if (count === 0) return [];
-
-  for (let i = 0; i < count; i++) {
-    voters.push({
-      serialNumber: i + 1,
-      epicNumber: i < epics.length ? epics[i] : "",
-      voterName: i < allNames.length ? allNames[i] : "Unknown",
-      relationType: i < relations.length ? relations[i].type : "",
-      relationName: i < relations.length ? relations[i].name : "",
-      houseNo: i < houseNumbers.length ? houseNumbers[i] : "",
-      age: ageGenders[i].age,
-      gender: ageGenders[i].gender,
-    });
-  }
-
-  return voters;
+  return { voters: [] };
 }
 
-async function ocrPageAsync(imagePath: string): Promise<string> {
-  try {
-    const { stdout } = await execAsync(
-      `tesseract "${imagePath}" stdout -l hin --oem 1 --psm 4 2>/dev/null`,
-      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
-    );
-    return stdout;
-  } catch (e: any) {
-    console.error(`[OCR] OCR error for ${path.basename(imagePath)}: ${e.message?.substring(0, 300)}`);
-    return "";
-  }
-}
-
-function buildVoterRecord(v: ParsedVoter, fileId: string, boothNum: string, effectiveHeader: PdfHeaderInfo): InsertVoter {
-  const status = (v.epicNumber && v.voterName && v.voterName !== "Unknown" && v.age > 0)
+function buildVoterRecord(v: GeminiVoter, fileId: string, boothNum: string, header: PdfHeaderInfo): InsertVoter {
+  const status = (v.epic && v.name && v.age > 0)
     ? "verified" as const
-    : (v.epicNumber || (v.voterName && v.voterName !== "Unknown"))
+    : (v.epic || v.name)
       ? "flagged" as const
       : "incomplete" as const;
 
-  const genderLabel = v.gender === "M" ? "Male" : v.gender === "F" ? "Female" : v.gender;
+  const genderLabel = v.gender === "M" ? "Male" : v.gender === "F" ? "Female" : v.gender || "";
 
   return {
     fileId,
-    serialNumber: v.serialNumber,
-    epicNumber: v.epicNumber,
-    voterName: v.voterName,
-    voterNameEn: hindiToEnglish(v.voterName),
-    relationType: v.relationType,
-    relationName: v.relationName,
-    relationNameEn: hindiToEnglish(v.relationName),
+    serialNumber: v.serial || 0,
+    epicNumber: v.epic || "",
+    voterName: v.name || "Unknown",
+    voterNameEn: hindiToEnglish(v.name || ""),
+    relationType: v.relationType || "",
+    relationName: v.relationName || "",
+    relationNameEn: hindiToEnglish(v.relationName || ""),
     gender: genderLabel,
-    age: v.age || null,
-    houseNo: v.houseNo,
-    address: v.houseNo ? `House No. ${v.houseNo}` : "",
+    age: (v.age >= 18 && v.age <= 120) ? v.age : null,
+    houseNo: v.house || "",
+    address: v.house ? `House No. ${v.house}` : "",
     boothNumber: boothNum,
     partNumber: boothNum,
-    acNoName: effectiveHeader.acNoName,
-    constituency: effectiveHeader.acNoName,
-    sectionNumber: effectiveHeader.sectionNumber,
-    sectionName: effectiveHeader.sectionName,
+    acNoName: header.acNoName,
+    constituency: header.acNoName,
+    sectionNumber: header.sectionNumber,
+    sectionName: header.sectionName,
     sectionNameEn: null,
-    psName: effectiveHeader.psName,
-    state: effectiveHeader.state,
-    gram: hindiToEnglish(effectiveHeader.gram),
-    thana: hindiToEnglish(effectiveHeader.thana),
-    panchayat: hindiToEnglish(effectiveHeader.panchayat),
-    block: hindiToEnglish(effectiveHeader.block),
-    tahsil: hindiToEnglish(effectiveHeader.tahsil),
-    jilla: hindiToEnglish(effectiveHeader.jilla),
+    psName: header.psName,
+    state: header.state,
+    gram: hindiToEnglish(header.gram),
+    thana: hindiToEnglish(header.thana),
+    panchayat: hindiToEnglish(header.panchayat),
+    block: hindiToEnglish(header.block),
+    tahsil: hindiToEnglish(header.tahsil),
+    jilla: hindiToEnglish(header.jilla),
     status,
   };
 }
 
-async function processOnePdf(
+async function insertVoterBatch(voters: InsertVoter[]): Promise<void> {
+  const CHUNK = 200;
+  for (let c = 0; c < voters.length; c += CHUNK) {
+    const chunk = voters.slice(c, c + CHUNK);
+    try {
+      await storage.createVoterRecordsBatch(chunk);
+    } catch (e: any) {
+      console.error(`[OCR] Batch insert error: ${e.message?.substring(0, 100)}`);
+    }
+  }
+}
+
+async function processOnePdfWithGemini(
   pdfPath: string,
   fileId: string,
   pdfIndex: number,
-  globalSerialStart: number,
-  headerInfo: PdfHeaderInfo,
-  onProgress?: (page: number, totalPages: number, votersSoFar: number) => void
+  sharedHeader: PdfHeaderInfo,
 ): Promise<{ voters: InsertVoter[]; pagesProcessed: number; headerInfo: PdfHeaderInfo | null }> {
   const pdfName = path.basename(pdfPath);
   const imgDir = path.join(TEMP_DIR, `pdf_${fileId}_${pdfIndex}`);
@@ -422,104 +279,67 @@ async function processOnePdf(
   const allVoters: InsertVoter[] = [];
   let extractedHeader: PdfHeaderInfo | null = null;
 
-  console.log(`[OCR] Processing ${pdfName}: ${images.length} pages at ${DPI} DPI (${PAGE_PARALLELISM} parallel)`);
+  const processPage = async (imgPath: string): Promise<GeminiPageResult> => {
+    const result = await extractPageWithGemini(imgPath);
+    try { fs.unlinkSync(imgPath); } catch {}
+    return result;
+  };
 
-  if (images.length > 0) {
-    const firstOcr = await ocrPageAsync(images[0]);
-    try { fs.unlinkSync(images[0]); } catch {}
-    if (firstOcr.trim()) {
-      const hdr = parseHeaderPage(firstOcr);
-      if (hdr.acNoName || hdr.partNumber || hdr.sectionName) {
-        extractedHeader = hdr;
-        if (hdr.gram || hdr.thana || hdr.jilla) {
-          console.log(`[OCR] Location: gram=${hdr.gram}, thana=${hdr.thana}, panchayat=${hdr.panchayat}, block=${hdr.block}, tahsil=${hdr.tahsil}, jilla=${hdr.jilla}`);
-        }
-      }
-      const hasVoterData = firstOcr.includes("नाम") && firstOcr.includes("आयु");
-      if (hasVoterData) {
-        const parsed = parseVoterBlocks(firstOcr);
-        const effectiveHeader = extractedHeader || headerInfo;
-        const boothNum = boothFromFilename || effectiveHeader.partNumber;
-        for (const v of parsed) {
-          allVoters.push(buildVoterRecord(v, fileId, boothNum, effectiveHeader));
-        }
-      }
+  const pageResults = await processWithConcurrency(images, GEMINI_CONCURRENCY, processPage);
+
+  for (const result of pageResults) {
+    if (result.header && !extractedHeader) {
+      const h = result.header;
+      extractedHeader = {
+        acNoName: h.acNoName || "",
+        partNumber: h.partNumber || "",
+        sectionNumber: h.sectionNumber || "",
+        sectionName: h.sectionName || "",
+        psName: h.psName || "",
+        state: "Uttar Pradesh",
+        gram: h.gram || "",
+        thana: h.thana || "",
+        panchayat: h.panchayat || "",
+        block: h.block || "",
+        tahsil: h.tahsil || "",
+        jilla: h.jilla || "",
+      };
     }
-    if (onProgress) onProgress(1, images.length, allVoters.length);
-  }
 
-  const remaining = images.slice(1);
-  for (let batchStart = 0; batchStart < remaining.length; batchStart += PAGE_PARALLELISM) {
-    const batch = remaining.slice(batchStart, batchStart + PAGE_PARALLELISM);
-    const results = await Promise.all(batch.map(async (img, bIdx) => {
-      const ocrText = await ocrPageAsync(img);
-      try { fs.unlinkSync(img); } catch {}
-      return { ocrText, pageIdx: batchStart + bIdx + 1 };
-    }));
-
-    for (const { ocrText, pageIdx } of results) {
-      if (!ocrText.trim()) continue;
-
-      if (pageIdx <= 2 && !extractedHeader) {
-        const hdr = parseHeaderPage(ocrText);
-        if (hdr.acNoName || hdr.partNumber || hdr.sectionName) {
-          extractedHeader = hdr;
-        }
-      }
-
-      const hasVoterData = ocrText.includes("नाम") && ocrText.includes("आयु");
-      if (!hasVoterData) continue;
-
-      const parsed = parseVoterBlocks(ocrText);
-      if (parsed.length === 0) continue;
-
-      const effectiveHeader = extractedHeader || headerInfo;
+    if (result.voters.length > 0) {
+      const effectiveHeader = extractedHeader || sharedHeader;
       const boothNum = boothFromFilename || effectiveHeader.partNumber;
-      for (const v of parsed) {
+      for (const v of result.voters) {
         allVoters.push(buildVoterRecord(v, fileId, boothNum, effectiveHeader));
       }
     }
-
-    const totalDone = Math.min(batchStart + PAGE_PARALLELISM + 1, images.length);
-    if (onProgress) onProgress(totalDone, images.length, allVoters.length);
   }
 
   cleanupDir(imgDir);
   return { voters: allVoters, pagesProcessed: images.length, headerInfo: extractedHeader };
 }
 
-async function processInParallel<T>(
+async function processWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
-  processor: (item: T, index: number) => Promise<void>
-): Promise<void> {
+  processor: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
   let nextIndex = 0;
-  const total = items.length;
 
   async function worker() {
-    while (nextIndex < total) {
+    while (nextIndex < items.length) {
       const idx = nextIndex++;
-      await processor(items[idx], idx);
+      results[idx] = await processor(items[idx]);
     }
   }
 
   const workers: Promise<void>[] = [];
-  for (let i = 0; i < Math.min(concurrency, total); i++) {
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
     workers.push(worker());
   }
   await Promise.all(workers);
-}
-
-async function insertVoterBatch(voters: any[]): Promise<void> {
-  const CHUNK = 200;
-  for (let c = 0; c < voters.length; c += CHUNK) {
-    const chunk = voters.slice(c, c + CHUNK);
-    try {
-      await storage.createVoterRecordsBatch(chunk);
-    } catch (e: any) {
-      console.error(`[OCR] Batch insert error: ${e.message?.substring(0, 100)}`);
-    }
-  }
+  return results;
 }
 
 export async function processZipFile(zipPath: string, fileId: string): Promise<void> {
@@ -536,7 +356,7 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     await storage.updateFile(fileId, { status: "processing", progress: 0 });
     await storage.createAuditLog({
       action: "Processing Started",
-      details: `Started processing file ${fileId}`,
+      details: `Started processing file ${fileId} with Gemini AI OCR`,
       status: "Success",
     });
 
@@ -591,9 +411,6 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     });
 
     console.log(`[OCR] Valid PDFs: ${validPdfs.length}, Skipped (empty/tiny): ${skippedPdfs.length}`);
-    if (skippedPdfs.length > 0) {
-      console.log(`[OCR] Skipped files: ${skippedPdfs.slice(0, 10).join(", ")}${skippedPdfs.length > 10 ? ` ... and ${skippedPdfs.length - 10} more` : ""}`);
-    }
 
     if (validPdfs.length === 0) {
       await storage.updateFile(fileId, { status: "failed", errorMessage: "No valid PDF files found in ZIP archive" });
@@ -611,7 +428,7 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
       validPdfs.splice(0, alreadyProcessed);
     } else {
       await storage.deleteVoterRecordsByFileId(fileId);
-      console.log(`[OCR] Cleared old records, starting fresh insert`);
+      console.log(`[OCR] Cleared old records, starting fresh`);
     }
 
     await storage.updateFile(fileId, {
@@ -627,7 +444,6 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
       sectionName: "",
       psName: "",
       state: "Uttar Pradesh",
-      totalVoters: "",
       gram: "",
       thana: "",
       panchayat: "",
@@ -639,19 +455,23 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     let totalVoters = isResume ? alreadyExtracted : 0;
     let processedCount = isResume ? alreadyProcessed : 0;
     let failedPdfs: string[] = [];
-
     const startTime = Date.now();
+    const originalTotal = totalFound - skippedPdfs.length;
 
-    console.log(`[OCR] Starting parallel processing: ${validPdfs.length} PDFs with CONCURRENCY=${CONCURRENCY}, PAGE_PARALLELISM=${PAGE_PARALLELISM}, DPI=${DPI}`);
+    console.log(`[OCR] Starting Gemini AI processing: ${validPdfs.length} PDFs, PDF_CONCURRENCY=${PDF_CONCURRENCY}, GEMINI_CONCURRENCY=${GEMINI_CONCURRENCY}`);
 
-    await processInParallel(validPdfs, CONCURRENCY, async (pdfPath, idx) => {
+    await processWithConcurrency(validPdfs, PDF_CONCURRENCY, async (pdfPath) => {
       if (!activeProcessing.has(fileId)) return;
       const pdfName = path.basename(pdfPath);
       try {
-        const result = await processOnePdf(pdfPath, fileId, idx, 0, defaultHeader);
+        const result = await processOnePdfWithGemini(pdfPath, fileId, processedCount, defaultHeader);
 
         if (result.headerInfo && !defaultHeader.acNoName && result.headerInfo.acNoName) {
           defaultHeader.acNoName = result.headerInfo.acNoName;
+        }
+        if (result.headerInfo) {
+          if (!defaultHeader.gram && result.headerInfo.gram) defaultHeader.gram = result.headerInfo.gram;
+          if (!defaultHeader.jilla && result.headerInfo.jilla) defaultHeader.jilla = result.headerInfo.jilla;
         }
 
         if (result.voters.length > 0) {
@@ -660,16 +480,15 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
         }
 
         processedCount++;
-        const originalTotal = totalFound - skippedPdfs.length;
         const progress = Math.floor((processedCount / originalTotal) * 100);
         const sessionProcessed = processedCount - (isResume ? alreadyProcessed : 0);
         const elapsed = (Date.now() - startTime) / 1000;
         const sessionRate = sessionProcessed > 0 ? sessionProcessed / (elapsed / 3600) : 0;
         const avgMs = sessionProcessed > 0 ? Math.floor(elapsed * 1000 / sessionProcessed) : 0;
 
-        if (processedCount % 5 === 0 || processedCount <= 5 || (isResume && sessionProcessed <= 3)) {
+        if (processedCount % 10 === 0 || processedCount <= 5 || processedCount === originalTotal) {
           const remaining = originalTotal - processedCount;
-          const etaMin = avgMs > 0 ? ((remaining * avgMs / CONCURRENCY) / 1000 / 60).toFixed(1) : '?';
+          const etaMin = avgMs > 0 ? ((remaining * avgMs / PDF_CONCURRENCY) / 1000 / 60).toFixed(1) : '?';
           console.log(`[OCR] Progress: ${processedCount}/${originalTotal} PDFs (${progress}%) | ${totalVoters} voters | ${sessionRate.toFixed(0)} PDFs/hr | ETA: ${etaMin}m`);
         }
 
@@ -689,7 +508,6 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     });
 
     const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-    const originalTotal = totalFound - skippedPdfs.length;
     const finalRate = (originalTotal / ((Date.now() - startTime) / 1000 / 3600)).toFixed(0);
 
     console.log(`[OCR] COMPLETE: ${originalTotal} PDFs in ${totalTime} min | ${totalVoters} voters | ${finalRate} PDFs/hr`);
@@ -725,7 +543,6 @@ export async function processZipFile(zipPath: string, fileId: string): Promise<v
     });
   } finally {
     activeProcessing.delete(fileId);
-    cleanupDir(extractDir);
   }
 }
 
@@ -751,7 +568,6 @@ export async function processSinglePdfFile(pdfPath: string, fileId: string): Pro
       sectionName: "",
       psName: "",
       state: "Uttar Pradesh",
-      totalVoters: "",
       gram: "",
       thana: "",
       panchayat: "",
@@ -760,19 +576,8 @@ export async function processSinglePdfFile(pdfPath: string, fileId: string): Pro
       jilla: "",
     };
 
-    console.log(`[OCR] Starting single PDF processing: ${path.basename(pdfPath)}`);
-    const result = await processOnePdf(pdfPath, fileId, 0, 1, header, async (page, totalPages, votersSoFar) => {
-      const progress = Math.min(Math.floor((page / totalPages) * 100), 99);
-      const elapsed = Date.now() - startTime;
-      const avgMs = page > 0 ? Math.floor(elapsed / page) : 0;
-      await storage.updateFile(fileId, {
-        progress,
-        totalPages,
-        pagesProcessed: page,
-        extractedCount: votersSoFar,
-        avgPageTimeMs: avgMs,
-      });
-    });
+    console.log(`[OCR] Starting single PDF processing with Gemini: ${path.basename(pdfPath)}`);
+    const result = await processOnePdfWithGemini(pdfPath, fileId, 0, header);
 
     if (result.voters.length > 0) {
       await storage.deleteVoterRecordsByFileId(fileId);

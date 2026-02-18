@@ -91,3 +91,5 @@ export type InsertVoter = z.infer<typeof insertVoterSchema>;
 export type VoterRecord = typeof voterRecords.$inferSelect;
 export type InsertAuditLog = z.infer<typeof insertAuditLogSchema>;
 export type AuditLog = typeof auditLogs.$inferSelect;
+
+export * from "./models/chat";
