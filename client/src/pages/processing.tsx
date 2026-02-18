@@ -2,9 +2,9 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { FileText, Loader2, Download, MoreVertical } from "lucide-react";
+import { FileText, Loader2, Download, MoreVertical, RotateCcw, Clock, Zap, Timer } from "lucide-react";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -27,10 +27,66 @@ function timeAgo(dateStr: string) {
   return `${days}d ago`;
 }
 
+function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return `${min}m ${sec}s`;
+  const hr = Math.floor(min / 60);
+  const remainMin = min % 60;
+  return `${hr}h ${remainMin}m`;
+}
+
+function formatElapsed(startStr: string | null): string {
+  if (!startStr) return "";
+  const start = new Date(startStr).getTime();
+  const now = Date.now();
+  return formatDuration(now - start);
+}
+
+function calcEta(file: any): { etaStr: string; speed: string; perPage: string; votersPerMin: string } {
+  const result = { etaStr: "Calculating...", speed: "", perPage: "", votersPerMin: "" };
+  if (!file.processingStartedAt || !file.pagesProcessed || file.pagesProcessed === 0) return result;
+
+  const startMs = new Date(file.processingStartedAt).getTime();
+  const elapsed = Date.now() - startMs;
+  const totalItems = (file.totalPages || 0) - (file.skippedPages || 0);
+  const processed = file.pagesProcessed || 0;
+
+  if (processed > 0 && totalItems > 0) {
+    const avgMs = file.avgPageTimeMs || Math.floor(elapsed / processed);
+    const remaining = totalItems - processed;
+    const etaMs = remaining * avgMs;
+    result.etaStr = remaining <= 0 ? "Almost done..." : formatDuration(etaMs);
+    result.perPage = `${(avgMs / 1000).toFixed(1)}s/PDF`;
+    const pdfPerHr = processed / (elapsed / 3600000);
+    result.speed = `${pdfPerHr.toFixed(0)} PDFs/hr`;
+    if (file.extractedCount > 0) {
+      const votersPerMinute = (file.extractedCount / (elapsed / 60000));
+      result.votersPerMin = `${votersPerMinute.toFixed(0)} voters/min`;
+    }
+  }
+
+  return result;
+}
+
 export default function Processing() {
+  const queryClient = useQueryClient();
   const { data: files, isLoading } = useQuery<any[]>({
     queryKey: ["/api/files"],
     refetchInterval: 2000,
+  });
+
+  const reprocessMutation = useMutation({
+    mutationFn: async (fileId: string) => {
+      const res = await fetch(`/api/files/${fileId}/reprocess`, { method: "POST", credentials: "include" });
+      if (!res.ok) throw new Error("Reprocess failed");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/files"] });
+    },
   });
 
   return (
@@ -90,7 +146,7 @@ export default function Processing() {
                     </div>
                     <Progress value={file.progress} className="h-2" />
                     <div className="flex justify-between text-xs text-muted-foreground pt-1">
-                      <span>Processing page {file.pagesProcessed || 0} of {file.totalPages || 0}</span>
+                      <span>PDF {file.pagesProcessed || 0} of {(file.totalPages || 0) - (file.skippedPages || 0)} valid{file.skippedPages > 0 ? ` (${file.skippedPages} empty skipped)` : ""}</span>
                       <span>{file.extractedCount || 0} voters extracted</span>
                     </div>
                   </div>
@@ -101,20 +157,55 @@ export default function Processing() {
                     <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status Info</h4>
                     <div className="space-y-2 font-mono text-xs text-muted-foreground">
                       {file.status === "processing" ? (
-                        <>
-                          <p>Processing page {file.pagesProcessed || 0}...</p>
-                          <p>{file.extractedCount || 0} voters extracted so far</p>
-                          <p className="text-blue-600">OCR engine active</p>
-                        </>
+                        (() => {
+                          const eta = calcEta(file);
+                          const elapsed = formatElapsed(file.processingStartedAt);
+                          return (
+                            <>
+                              <p>Processing PDF {file.pagesProcessed || 0} of {(file.totalPages || 0) - (file.skippedPages || 0)}...</p>
+                              <p>{file.extractedCount || 0} voters extracted so far</p>
+                              {elapsed && (
+                                <div className="flex items-center gap-1 text-muted-foreground">
+                                  <Timer className="h-3 w-3" />
+                                  <span>Elapsed: {elapsed}</span>
+                                </div>
+                              )}
+                              <div className="mt-2 p-2 rounded-md bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 space-y-1">
+                                <div className="flex items-center gap-1 text-blue-700 dark:text-blue-300 font-semibold">
+                                  <Clock className="h-3 w-3" />
+                                  <span data-testid="text-eta">ETA: {eta.etaStr}</span>
+                                </div>
+                                {eta.perPage && (
+                                  <div className="flex items-center gap-1 text-blue-600 dark:text-blue-400">
+                                    <Zap className="h-3 w-3" />
+                                    <span data-testid="text-speed">{eta.perPage} | {eta.speed}</span>
+                                  </div>
+                                )}
+                                {eta.votersPerMin && (
+                                  <div className="text-blue-600 dark:text-blue-400" data-testid="text-voters-rate">
+                                    {eta.votersPerMin}
+                                  </div>
+                                )}
+                              </div>
+                              <p className="text-blue-600">OCR engine active</p>
+                            </>
+                          );
+                        })()
                       ) : file.status === "completed" ? (
                         <>
-                          <p>All {file.totalPages || 0} pages processed</p>
+                          <p>{file.pagesProcessed || 0} PDFs processed</p>
+                          {file.skippedPages > 0 && <p>{file.skippedPages} empty files skipped</p>}
                           <p>{file.extractedCount || 0} voters extracted</p>
+                          {file.processingStartedAt && (
+                            <p className="text-muted-foreground">
+                              Total time: {formatElapsed(file.processingStartedAt)}
+                            </p>
+                          )}
                           <p className="text-green-600">Task completed</p>
                         </>
                       ) : file.status === "failed" ? (
                         <>
-                          <p>Stopped at page {file.pagesProcessed || 0}</p>
+                          <p>Stopped at PDF {file.pagesProcessed || 0}</p>
                           <p className="text-red-500">{file.errorMessage || "Processing failed"}</p>
                         </>
                       ) : (
@@ -123,24 +214,28 @@ export default function Processing() {
                     </div>
                   </div>
                   
-                  <div className="pt-6 flex justify-end gap-2">
-                     {file.status === "completed" ? (
-                       <Button size="sm" className="w-full" data-testid={`button-download-${file.id}`}>
+                  <div className="pt-6 flex flex-col gap-2">
+                     {file.status === "completed" && (
+                       <Button size="sm" className="w-full" data-testid={`button-download-${file.id}`} onClick={() => {
+                         window.open(`/api/files/${file.id}/download`, '_blank');
+                       }}>
                          <Download className="mr-2 h-4 w-4" /> Download Excel
                        </Button>
-                     ) : (
-                       <DropdownMenu>
-                         <DropdownMenuTrigger asChild>
-                           <Button variant="outline" size="sm" className="w-full" data-testid={`button-actions-${file.id}`}>
-                             Actions <MoreVertical className="ml-2 h-4 w-4" />
-                           </Button>
-                         </DropdownMenuTrigger>
-                         <DropdownMenuContent align="end">
-                           <DropdownMenuItem>View Details</DropdownMenuItem>
-                           <DropdownMenuItem>Cancel Processing</DropdownMenuItem>
-                           <DropdownMenuItem className="text-destructive">Delete File</DropdownMenuItem>
-                         </DropdownMenuContent>
-                       </DropdownMenu>
+                     )}
+                     {(file.status === "completed" || file.status === "failed") && (
+                       <Button
+                         variant="outline"
+                         size="sm"
+                         className="w-full"
+                         data-testid={`button-reprocess-${file.id}`}
+                         disabled={reprocessMutation.isPending}
+                         onClick={() => reprocessMutation.mutate(file.id)}
+                       >
+                         <RotateCcw className="mr-2 h-4 w-4" /> Reprocess
+                       </Button>
+                     )}
+                     {file.status === "processing" && (
+                       <p className="text-xs text-center text-muted-foreground">Processing in progress...</p>
                      )}
                   </div>
                 </div>

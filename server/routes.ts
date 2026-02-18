@@ -6,11 +6,27 @@ import bcrypt from "bcryptjs";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import * as XLSX from "xlsx";
+import { processZipFile, processSinglePdfFile } from "./pdf-processor";
 
 const uploadDir = path.join(process.cwd(), "uploads");
+const chunksDir = path.join(process.cwd(), "uploads", "chunks");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
+if (!fs.existsSync(chunksDir)) {
+  fs.mkdirSync(chunksDir, { recursive: true });
+}
+
+const chunkUpload = multer({
+  storage: multer.diskStorage({
+    destination: chunksDir,
+    filename: (_req, file, cb) => {
+      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -20,13 +36,15 @@ const upload = multer({
       cb(null, uniqueName);
     },
   }),
-  limits: { fileSize: 5 * 1024 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = [".pdf", ".zip"];
     const ext = path.extname(file.originalname).toLowerCase();
     cb(null, allowed.includes(ext));
   },
 });
+
+const activeChunkedUploads = new Map<string, { totalChunks: number; receivedChunks: Set<number>; originalName: string; totalSize: number; mimeType: string }>();
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -204,10 +222,166 @@ export async function registerRoutes(
         status: "Success",
       });
 
-      // Simulate processing in background
-      simulateProcessing(file.id);
-
+      startProcessing(file.id, file.filename, file.originalName);
       return res.json(file);
+    } catch (error: any) {
+      return res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/files/upload/init", authMiddleware, async (req: Request, res: Response) => {
+    try {
+      const { fileName, fileSize, totalChunks, mimeType } = req.body;
+      if (!fileName || !fileSize || !totalChunks) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      const uploadId = `upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const uploadChunkDir = path.join(chunksDir, uploadId);
+      fs.mkdirSync(uploadChunkDir, { recursive: true });
+
+      activeChunkedUploads.set(uploadId, {
+        totalChunks,
+        receivedChunks: new Set(),
+        originalName: fileName,
+        totalSize: fileSize,
+        mimeType: mimeType || "application/octet-stream",
+      });
+
+      return res.json({ uploadId, totalChunks });
+    } catch (error: any) {
+      return res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/files/upload/chunk", authMiddleware, chunkUpload.single("chunk"), async (req: Request, res: Response) => {
+    try {
+      const { uploadId, chunkIndex } = req.body;
+      if (!uploadId || chunkIndex === undefined || !req.file) {
+        return res.status(400).json({ message: "Missing uploadId, chunkIndex, or chunk data" });
+      }
+
+      const session = activeChunkedUploads.get(uploadId);
+      if (!session) {
+        return res.status(404).json({ message: "Upload session not found" });
+      }
+
+      const idx = parseInt(chunkIndex);
+      const destPath = path.join(chunksDir, uploadId, `chunk_${idx}`);
+      fs.renameSync(req.file.path, destPath);
+      session.receivedChunks.add(idx);
+
+      return res.json({
+        received: idx,
+        totalReceived: session.receivedChunks.size,
+        totalChunks: session.totalChunks,
+        complete: session.receivedChunks.size === session.totalChunks,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/files/upload/complete", authMiddleware, async (req: Request, res: Response) => {
+    req.setTimeout(600000);
+    res.setTimeout(600000);
+    try {
+      const { uploadId } = req.body;
+      if (!uploadId) {
+        return res.status(400).json({ message: "Missing uploadId" });
+      }
+
+      const session = activeChunkedUploads.get(uploadId);
+      if (!session) {
+        return res.status(404).json({ message: "Upload session not found" });
+      }
+
+      if (session.receivedChunks.size !== session.totalChunks) {
+        return res.status(400).json({ 
+          message: `Missing chunks: received ${session.receivedChunks.size}/${session.totalChunks}` 
+        });
+      }
+
+      const finalName = `${Date.now()}-${Math.random().toString(36).slice(2)}-${session.originalName}`;
+      const finalPath = path.join(uploadDir, finalName);
+      const writeStream = fs.createWriteStream(finalPath);
+
+      for (let i = 0; i < session.totalChunks; i++) {
+        const chunkPath = path.join(chunksDir, uploadId, `chunk_${i}`);
+        await new Promise<void>((resolve, reject) => {
+          const readStream = fs.createReadStream(chunkPath);
+          readStream.on("error", reject);
+          readStream.on("end", () => {
+            fs.unlink(chunkPath, () => {});
+            resolve();
+          });
+          readStream.pipe(writeStream, { end: false });
+        });
+      }
+
+      writeStream.end();
+
+      await new Promise<void>((resolve, reject) => {
+        writeStream.on("finish", resolve);
+        writeStream.on("error", reject);
+      });
+
+      const chunkDir = path.join(chunksDir, uploadId);
+      if (fs.existsSync(chunkDir)) {
+        fs.rmSync(chunkDir, { recursive: true });
+      }
+
+      activeChunkedUploads.delete(uploadId);
+
+      const file = await storage.createFile({
+        filename: finalName,
+        originalName: session.originalName,
+        size: session.totalSize,
+        mimeType: session.mimeType,
+        status: "pending",
+        progress: 100,
+        totalPages: 0,
+        pagesProcessed: 0,
+        extractedCount: 0,
+        uploadedBy: req.session?.userId || null,
+      });
+
+      await storage.createAuditLog({
+        action: "File Upload",
+        userId: req.session?.userId,
+        userName: req.session?.displayName,
+        details: `Uploaded ${session.originalName} (${(session.totalSize / 1024 / 1024).toFixed(2)} MB) via chunked upload`,
+        status: "Success",
+      });
+
+      startProcessing(file.id, finalName, session.originalName);
+      return res.json(file);
+    } catch (error: any) {
+      console.error("[Upload Complete] Error:", error);
+      const msg = error?.message || String(error) || "Unknown upload completion error";
+      return res.status(500).json({ message: msg });
+    }
+  });
+
+  app.post("/api/files/:id/reprocess", authMiddleware, async (req: Request, res: Response) => {
+    try {
+      const fileId = req.params.id as string;
+      const file = await storage.getFile(fileId);
+      if (!file) return res.status(404).json({ message: "File not found" });
+
+      await storage.updateFile(fileId, { status: "pending", progress: 0, pagesProcessed: 0, extractedCount: 0, errorMessage: null });
+
+      startProcessing(fileId, file.filename, file.originalName);
+
+      await storage.createAuditLog({
+        action: "Reprocessing",
+        userId: req.session?.userId,
+        userName: req.session?.displayName,
+        details: `Reprocessing file ${file.originalName}`,
+        status: "Success",
+      });
+
+      return res.json({ message: "Reprocessing started" });
     } catch (error: any) {
       return res.status(500).json({ message: error.message });
     }
@@ -215,13 +389,14 @@ export async function registerRoutes(
 
   app.delete("/api/files/:id", authMiddleware, async (req: Request, res: Response) => {
     try {
-      const file = await storage.getFile(req.params.id);
+      const fileId = req.params.id as string;
+      const file = await storage.getFile(fileId);
       if (!file) return res.status(404).json({ message: "File not found" });
 
       const filePath = path.join(uploadDir, file.filename);
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
-      await storage.deleteFile(req.params.id);
+      await storage.deleteFile(fileId);
 
       await storage.createAuditLog({
         action: "File Delete",
@@ -232,6 +407,82 @@ export async function registerRoutes(
       });
 
       return res.json({ message: "File deleted" });
+    } catch (error: any) {
+      return res.status(500).json({ message: error.message });
+    }
+  });
+
+  // ===== EXCEL DOWNLOAD =====
+  app.get("/api/files/:id/download", authMiddleware, async (req: Request, res: Response) => {
+    try {
+      const fileId = req.params.id as string;
+      const file = await storage.getFile(fileId);
+      if (!file) return res.status(404).json({ message: "File not found" });
+
+      const wb = XLSX.utils.book_new();
+      const headers = [
+        "Full Name", "Father/Husband", "EPIC",
+        "Gender", "Age", "Address", "Polling Station",
+        "Gram", "Thana", "Panchayat", "Block", "Tahsil", "Jilla"
+      ];
+      const ws = XLSX.utils.aoa_to_sheet([headers]);
+
+      const BATCH = 5000;
+      let offset = 0;
+      let rowIndex = 1;
+      let totalAdded = 0;
+
+      while (true) {
+        const batch = await storage.getVoterRecordsByFileIdPaginated(fileId, BATCH, offset);
+        if (batch.length === 0) break;
+
+        const rows = batch.map((r) => {
+          const addr = r.houseNo ? `House No. ${r.houseNo}` : (r.address || "");
+          return [
+            r.voterName || "",
+            r.relationName || "",
+            r.epicNumber || "",
+            r.gender || "",
+            r.age || "",
+            addr,
+            r.psName || "",
+            r.gram || "",
+            r.thana || "",
+            r.panchayat || "",
+            r.block || "",
+            r.tahsil || "",
+            r.jilla || "",
+          ];
+        });
+
+        XLSX.utils.sheet_add_aoa(ws, rows, { origin: rowIndex });
+        rowIndex += rows.length;
+        totalAdded += batch.length;
+        offset += BATCH;
+
+        if (batch.length < BATCH) break;
+      }
+
+      if (totalAdded === 0) {
+        return res.status(404).json({ message: "No voter records found for this file" });
+      }
+
+      const colWidths = [
+        { wch: 22 }, { wch: 22 }, { wch: 16 },
+        { wch: 8 }, { wch: 6 }, { wch: 18 }, { wch: 30 },
+        { wch: 20 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 18 },
+      ];
+      ws["!cols"] = colWidths;
+
+      const safeName = file.originalName.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 31);
+      XLSX.utils.book_append_sheet(wb, ws, safeName || "Voter Records");
+
+      const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const downloadName = `${file.originalName.replace(/\.[^.]+$/, "")}_voters.xlsx`;
+
+      res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      return res.send(buffer);
     } catch (error: any) {
       return res.status(500).json({ message: error.message });
     }
@@ -262,7 +513,7 @@ export async function registerRoutes(
 
   app.put("/api/voters/:id", authMiddleware, async (req: Request, res: Response) => {
     try {
-      const updated = await storage.updateVoterRecord(req.params.id, req.body);
+      const updated = await storage.updateVoterRecord(req.params.id as string, req.body);
       if (!updated) return res.status(404).json({ message: "Record not found" });
 
       await storage.createAuditLog({
@@ -330,6 +581,22 @@ export async function registerRoutes(
     }
   });
 
+  // ===== RECOVER INTERRUPTED PROCESSING =====
+  try {
+    const files = await storage.getFiles();
+    for (const file of files) {
+      if (file.status === "processing" || file.status === "uploading") {
+        console.log(`Recovering interrupted file: ${file.originalName} (was ${file.status})`);
+        await storage.updateFile(file.id, {
+          status: "failed",
+          errorMessage: "Processing was interrupted by server restart. Click Reprocess to try again.",
+        });
+      }
+    }
+  } catch (e) {
+    console.log("Recovery check skipped");
+  }
+
   // ===== SEED DEFAULT ADMIN =====
   try {
     const adminExists = await storage.getUserByUsername("admin@ec.gov.in");
@@ -349,52 +616,21 @@ export async function registerRoutes(
   return httpServer;
 }
 
-async function simulateProcessing(fileId: string) {
-  const voterNames = [
-    "Aarav Sharma", "Vivaan Singh", "Aditya Kumar", "Vihaan Gupta", "Arjun Patel",
-    "Sai Reddy", "Reyansh Joshi", "Ayaan Malhotra", "Krishna Verma", "Ishaan Bhat",
-    "Priya Sharma", "Ananya Singh", "Divya Patel", "Meera Gupta", "Kavya Reddy",
-  ];
-  const relationNames = [
-    "Rajesh Sharma", "Amit Singh", "Suresh Kumar", "Manoj Gupta", "Vikram Patel",
-    "Ramesh Reddy", "Sanjay Joshi", "Deepak Malhotra", "Vijay Verma", "Anil Bhat",
-  ];
+function startProcessing(fileId: string, filename: string, originalName: string) {
+  const filePath = path.join(uploadDir, filename);
+  const ext = path.extname(originalName).toLowerCase();
 
-  const totalPages = 10 + Math.floor(Math.random() * 30);
-
-  await storage.updateFile(fileId, { status: "processing", totalPages, progress: 0 });
-
-  for (let page = 1; page <= totalPages; page++) {
-    await new Promise((r) => setTimeout(r, 300 + Math.random() * 500));
-
-    const votersOnPage = 3 + Math.floor(Math.random() * 8);
-    const records = Array.from({ length: votersOnPage }).map((_, i) => ({
-      fileId,
-      serialNumber: (page - 1) * 10 + i + 1,
-      epicNumber: `GDN${Math.floor(1000000 + Math.random() * 9000000)}`,
-      voterName: voterNames[Math.floor(Math.random() * voterNames.length)],
-      relationName: relationNames[Math.floor(Math.random() * relationNames.length)],
-      gender: Math.random() > 0.48 ? "Male" : "Female",
-      age: 18 + Math.floor(Math.random() * 60),
-      address: `${Math.floor(Math.random() * 100) + 1}, Gandhi Nagar, Sector ${Math.floor(Math.random() * 20) + 1}, New Delhi`,
-      boothNumber: `Booth ${100 + Math.floor(Math.random() * 10)}`,
-      partNumber: `AC-${100 + Math.floor(page / 5)}`,
-      constituency: "New Delhi Central",
-      state: "Delhi",
-      status: Math.random() > 0.85 ? ("flagged" as const) : ("verified" as const),
-    }));
-
-    try {
-      await storage.createVoterRecordsBatch(records);
-    } catch (e) {}
-
-    const progress = Math.floor((page / totalPages) * 100);
-    await storage.updateFile(fileId, {
-      pagesProcessed: page,
-      progress,
-      extractedCount: (page * votersOnPage),
+  if (ext === ".zip") {
+    processZipFile(filePath, fileId).catch((e) => {
+      console.error(`ZIP processing failed for ${fileId}: ${e.message}`);
+      storage.updateFile(fileId, { status: "failed", errorMessage: e.message });
     });
+  } else if (ext === ".pdf") {
+    processSinglePdfFile(filePath, fileId).catch((e) => {
+      console.error(`PDF processing failed for ${fileId}: ${e.message}`);
+      storage.updateFile(fileId, { status: "failed", errorMessage: e.message });
+    });
+  } else {
+    storage.updateFile(fileId, { status: "failed", errorMessage: `Unsupported file type: ${ext}` });
   }
-
-  await storage.updateFile(fileId, { status: "completed", progress: 100, pagesProcessed: totalPages });
 }

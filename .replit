@@ -4,6 +4,7 @@ hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
 
 [nix]
 channel = "stable-24_05"
+packages = ["file", "unzip", "tesseract", "poppler_utils", "ghostscript"]
 
 [[ports]]
 localPort = 5000

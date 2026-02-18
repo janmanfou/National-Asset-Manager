@@ -34,6 +34,10 @@ export interface IStorage {
   getAgeDistribution(): Promise<{ ageGroup: string; count: number }[]>;
   getBoothStats(): Promise<{ boothNumber: string; count: number }[]>;
 
+  getVoterRecordsByFileId(fileId: string): Promise<VoterRecord[]>;
+  getVoterRecordsByFileIdPaginated(fileId: string, limit: number, offset: number): Promise<VoterRecord[]>;
+  deleteVoterRecordsByFileId(fileId: string): Promise<void>;
+
   // Audit Logs
   getAuditLogs(limit?: number): Promise<AuditLog[]>;
   createAuditLog(log: InsertAuditLog): Promise<AuditLog>;
@@ -197,6 +201,22 @@ export class DatabaseStorage implements IStorage {
       count: count(),
     }).from(voterRecords).where(sql`${voterRecords.boothNumber} IS NOT NULL`).groupBy(voterRecords.boothNumber).orderBy(desc(count()));
     return results.map(r => ({ boothNumber: r.boothNumber ?? "Unknown", count: Number(r.count) }));
+  }
+
+  async getVoterRecordsByFileId(fileId: string): Promise<VoterRecord[]> {
+    return db.select().from(voterRecords).where(eq(voterRecords.fileId, fileId)).orderBy(voterRecords.serialNumber);
+  }
+
+  async getVoterRecordsByFileIdPaginated(fileId: string, limit: number, offset: number): Promise<VoterRecord[]> {
+    return db.select().from(voterRecords)
+      .where(eq(voterRecords.fileId, fileId))
+      .orderBy(voterRecords.serialNumber)
+      .limit(limit)
+      .offset(offset);
+  }
+
+  async deleteVoterRecordsByFileId(fileId: string): Promise<void> {
+    await db.delete(voterRecords).where(eq(voterRecords.fileId, fileId));
   }
 
   // Audit Logs

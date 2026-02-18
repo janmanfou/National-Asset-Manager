@@ -42,7 +42,7 @@ Preferred communication style: Simple, everyday language.
 - **Key tables**:
   - `users` — user accounts with roles (admin/candidate/worker)
   - `uploaded_files` — file upload tracking with status/progress
-  - `voter_records` — extracted voter data (name, EPIC number, age, gender, booth, constituency, etc.)
+  - `voter_records` — extracted voter data (name, EPIC, age, gender, address, gram, thana, panchayat, block, tahsil, jilla)
   - `audit_logs` — system activity trail
 - **Schema push**: Use `npm run db:push` to push schema changes to the database
 
